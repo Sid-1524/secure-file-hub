@@ -21,17 +21,29 @@ class FileServerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", content_type)
         self.end_headers()
 
+    def _log(self, message):
+        print(f"[LOG] {message}")
+
     def _authenticate(self):
         token = self.headers.get("Authorization", "").replace("Bearer ", "")
         if not token:
+            self._log("Authentication failed: No token provided")
             return None
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute('''SELECT user_id FROM sessions 
-                      WHERE token = ? AND datetime(expires) > datetime('now')''',
-                    (token,))
-            result = c.fetchone()
-            return result[0] if result else None
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute('''SELECT user_id FROM sessions 
+                          WHERE token = ? AND datetime(expires) > datetime('now')''',
+                        (token,))
+                result = c.fetchone()
+                if result:
+                    self._log(f"Authenticated user: {result[0]}")
+                else:
+                    self._log("Authentication failed: Invalid or expired token")
+                return result[0] if result else None
+        except sqlite3.Error as e:
+            self._log(f"Database error during authentication: {e}")
+            return None
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -63,6 +75,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
         password = data.get("password")
         if not user_id or not password:
             return self._send_json({"error": "Missing credentials"}, 400)
+        if not isinstance(user_id, str) or not isinstance(password, str):
+            return self._send_json({"error": "Invalid input types"}, 400)
         try:
             hashed_pw = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
             with sqlite3.connect(DB_PATH) as conn:
@@ -73,6 +87,32 @@ class FileServerHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "Registered successfully"})
         except sqlite3.IntegrityError:
             self._send_json({"error": "User already exists"}, 409)
+        except sqlite3.Error as e:
+            self._log(f"Database error during registration: {e}")
+            self._send_json({"error": "Database error"}, 500)
+
+    def _handle_login(self):
+        data = self._read_json()
+        user_id = data.get("user_id")
+        password = data.get("password")
+        if not user_id or not password:
+            return self._send_json({"error": "Missing credentials"}, 400)
+        if not isinstance(user_id, str) or not isinstance(password, str):
+            return self._send_json({"error": "Invalid input types"}, 400)
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute('SELECT password_hash FROM users WHERE id = ?', (user_id,))
+                result = c.fetchone()
+                if not result or not bcrypt.checkpw(password.encode(), result[0]):
+                    return self._send_json({"error": "Invalid credentials"}, 401)
+                token = str(uuid.uuid4())
+                c.execute('INSERT INTO sessions VALUES (?, ?, datetime("now", "+1 hour"))', (token, user_id))
+                conn.commit()
+                self._send_json({"token": token, "user_id": user_id})
+        except sqlite3.Error as e:
+            self._log(f"Database error during login: {e}")
+            self._send_json({"error": "Database error"}, 500)
 
     def _handle_login(self):
         data = self._read_json()
@@ -90,22 +130,107 @@ class FileServerHandler(BaseHTTPRequestHandler):
             self._send_json({"token": token, "user_id": user_id})
 
     def _handle_upload(self):
+        """
+        Handle file upload from authenticated user.
+        """
         user_id = self._authenticate()
         if not user_id:
             return self._send_json({"error": "Unauthorized"}, 401)
         filename = self.headers.get("X-Filename")
-        if not filename:
-            return self._send_json({"error": "Missing filename"}, 400)
+        if not filename or not isinstance(filename, str):
+            return self._send_json({"error": "Missing or invalid filename"}, 400)
         file_path = os.path.join(UPLOAD_ROOT, user_id, filename)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        content_length = int(self.headers['Content-Length'])
-        with open(file_path, "wb") as f:
-            f.write(self.rfile.read(content_length))
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute('INSERT OR REPLACE INTO files VALUES (?, ?, ?)', (filename, user_id, file_path))
-            conn.commit()
-        self._send_json({"status": "File uploaded"})
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length <= 0:
+                return self._send_json({"error": "Invalid content length"}, 400)
+            with open(file_path, "wb") as f:
+                f.write(self.rfile.read(content_length))
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute('INSERT OR REPLACE INTO files VALUES (?, ?, ?)', (filename, user_id, file_path))
+                conn.commit()
+            self._send_json({"status": "File uploaded"})
+        except Exception as e:
+            self._log(f"Error during file upload: {e}")
+            self._send_json({"error": "File upload failed"}, 500)
+
+    def _handle_delete(self):
+        """
+        Handle file deletion request from authenticated user.
+        """
+        user_id = self._authenticate()
+        if not user_id:
+            return self._send_json({"error": "Unauthorized"}, 401)
+        data = self._read_json()
+        filename = data.get("filename")
+        if not filename or not isinstance(filename, str):
+            return self._send_json({"error": "Missing or invalid filename"}, 400)
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute('SELECT path FROM files WHERE filename = ? AND user_id = ?', (filename, user_id))
+                result = c.fetchone()
+                if not result:
+                    return self._send_json({"error": "File not found"}, 404)
+                file_path = result[0]
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                c.execute('DELETE FROM files WHERE filename = ? AND user_id = ?', (filename, user_id))
+                conn.commit()
+            self._send_json({"status": "File deleted"})
+        except Exception as e:
+            self._log(f"Error during file deletion: {e}")
+            self._send_json({"error": "File deletion failed"}, 500)
+
+    def _handle_list_files(self):
+        """
+        Handle request to list files for authenticated user.
+        """
+        user_id = self._authenticate()
+        if not user_id:
+            return self._send_json({"error": "Unauthorized"}, 401)
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute('SELECT filename, path FROM files WHERE user_id = ?', (user_id,))
+                files = []
+                for filename, path in c.fetchall():
+                    if os.path.exists(path):
+                        files.append(filename)
+                    else:
+                        # Remove file record if file does not exist
+                        c.execute('DELETE FROM files WHERE filename = ? AND user_id = ?', (filename, user_id))
+                conn.commit()
+            self._send_json({"files": files})
+        except Exception as e:
+            self._log(f"Error listing files: {e}")
+            self._send_json({"error": "Failed to list files"}, 500)
+
+    def _handle_download(self, filename):
+        """
+        Handle file download request for authenticated user.
+        """
+        user_id = self._authenticate()
+        if not user_id:
+            return self._send_json({"error": "Unauthorized"}, 401)
+        if not filename or not isinstance(filename, str):
+            return self._send_json({"error": "Invalid filename"}, 400)
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute('SELECT path FROM files WHERE filename = ? AND user_id = ?', (filename, user_id))
+                result = c.fetchone()
+                if not result or not os.path.exists(result[0]):
+                    return self._send_json({"error": "File not found"}, 404)
+                self._set_headers(200, "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                with open(result[0], "rb") as f:
+                    self.wfile.write(f.read())
+        except Exception as e:
+            self._log(f"Error during file download: {e}")
+            self._send_json({"error": "File download failed"}, 500)
 
     def _handle_delete(self):
         user_id = self._authenticate()

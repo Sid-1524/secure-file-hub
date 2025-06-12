@@ -75,8 +75,10 @@ class FileHubApp:
                     self.file_list.insert(END, file)
             else:
                 self._show_error(response.json().get("error", "Unknown error"))
+        except requests.RequestException as e:
+            self._show_error(f"Network error: {str(e)}")
         except Exception as e:
-            self._show_error(str(e))
+            self._show_error(f"Unexpected error: {str(e)}")
 
     def do_upload(self):
         file_path = filedialog.askopenfilename()
@@ -97,8 +99,12 @@ class FileHubApp:
                     self.load_files()
                 else:
                     self._show_error(response.json().get("error", "Upload failed"))
+        except FileNotFoundError:
+            self._show_error("File not found")
+        except requests.RequestException as e:
+            self._show_error(f"Network error: {str(e)}")
         except Exception as e:
-            self._show_error(str(e))
+            self._show_error(f"Unexpected error: {str(e)}")
 
     def do_download(self):
         selections = self.file_list.curselection()
