@@ -19,20 +19,6 @@ A self-hosted, cross-platform file storage and sharing solution featuring:
 
 ---
 
-## Directory Structure
-
-```
-D:\Coding\Server\
-├── server.py            # Python socket server
-├── database.py          # Database initialization script
-├── file_hub_gui.py      # Tkinter desktop GUI client
-├── file_server.db       # SQLite database
-├── user_files/          # User file storage
-└── README.md            # This file
-```
-
----
-
 ## Quick Start
 
 ### 1. Clone or Download the Project
@@ -160,4 +146,3 @@ UPLOAD_ROOT = r"E:\\MyData\\Uploads"
 ```
 
 This flexibility allows you to organize your data storage according to your preferences or system setup.
-```
